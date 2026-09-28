@@ -18,7 +18,6 @@ Pipeline
       -> Display      : arrow + bars drawn over the video, optional
                         comparison against an autopilot log
 
-No crypto, no custom SDK: only numpy, scipy, pandas, pyarrow, opencv.
 
 IMPORTANT: the encoder (video -> neurons) and the decoder (neurons -> motion)
 are hand-designed choices, not validated fly biology. The connectome in the
@@ -89,6 +88,7 @@ READOUT_CELL_TYPES = {
 READOUT_WINDOW_MS = 200.0   # rolling window for spike-rate estimates
 STEER_DEADBAND_HZ = 2.0     # L-R difference below this counts as "straight"
 STEER_FULL_SCALE_HZ = 15.0  # L-R difference drawn as a hard turn on screen
+MOVE_FULL_SCALE_HZ = 15.0   # forward-minus-backward rate drawn as a full-length arrow
 ESCAPE_THRESHOLD_HZ = 20.0  # giant fiber rate that counts as "escape"
 
 # Degrees of visual angle per "ommatidium" after downsampling. Real flies are
@@ -514,14 +514,24 @@ def draw_overlay(frame, eye: FlyEye, feats, r: Readout, info: str,
     h, w = frame.shape[:2]
     out = frame.copy()
 
-    # heading arrow: up = straight, tilted by steering difference
+    # movement arrow from frame centre: x = steering (R-L), y = forward (up)
+    # minus backward (down); length = magnitude of the desired movement
     max_hz = STEER_FULL_SCALE_HZ
-    angle = np.clip(r.turn_hz / max_hz, -1, 1) * np.radians(70)
-    base = (w // 2, int(h * 0.72))
-    length = int(h * 0.3)
-    tip = (int(base[0] + length * np.sin(angle)), int(base[1] - length * np.cos(angle)))
+    def mean_rate(name):
+        sides = r.rates.get(name, {})
+        return float(np.mean(list(sides.values()))) if sides else 0.0
+    x = np.clip(r.turn_hz / max_hz, -1, 1)
+    y = np.clip((mean_rate("forward") - mean_rate("backward")) / MOVE_FULL_SCALE_HZ, -1, 1)
+    mag = np.hypot(x, y)
+    if mag > 1:
+        x, y = x / mag, y / mag
+    base = (w // 2, h // 2)
+    reach = 0.45 * min(w, h)
+    tip = (int(base[0] + reach * x), int(base[1] - reach * y))
     color = (0, 0, 255) if r.command.startswith("ESCAPE") else (0, 255, 255)
-    cv2.arrowedLine(out, base, tip, color, 6, tipLength=0.2)
+    cv2.circle(out, base, 5, color, -1)
+    if np.hypot(tip[0] - base[0], tip[1] - base[1]) >= 3:
+        cv2.arrowedLine(out, base, tip, color, 6, tipLength=0.2)
     (tw_, _), _ = cv2.getTextSize(r.command, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
     cv2.putText(out, r.command, (w // 2 - tw_ // 2, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)

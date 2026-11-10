@@ -29,6 +29,7 @@ Quick start
     python fly_navigator.py --source loom-left     # escape sanity test
     python fly_navigator.py --source 0             # webcam 0
     python fly_navigator.py --source flight.mp4 --compare autopilot.csv
+    python fly_navigator.py --source 0 --pantilt   # fly steers the camera gimbal
 """
 
 from __future__ import annotations
@@ -36,6 +37,8 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import sys
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -90,6 +93,14 @@ STEER_DEADBAND_HZ = 2.0     # L-R difference below this counts as "straight"
 STEER_FULL_SCALE_HZ = 15.0  # L-R difference drawn as a hard turn on screen
 MOVE_FULL_SCALE_HZ = 15.0   # forward-minus-backward rate drawn as a full-length arrow
 ESCAPE_THRESHOLD_HZ = 20.0  # giant fiber rate that counts as "escape"
+
+# Pan/tilt gimbal (--pantilt): the steering signal sets the pan *velocity*,
+# like a fly turning its head. Full-scale steering (STEER_FULL_SCALE_HZ) pans
+# at PAN_MAX_RATE_DEG_S; anything inside STEER_DEADBAND_HZ holds still.
+PAN_MAX_RATE_DEG_S = 60.0
+PAN_LIMIT_DEG = 135.0        # +/- pan travel from centre
+PAN_MAX_DT_S = 0.2          # cap per-update integration step (stalls, slow frames)
+PAN_SERVO_SIGN = -1.0       # servo angle up = camera turns left on this rig
 
 # Degrees of visual angle per "ommatidium" after downsampling. Real flies are
 # ~5 degrees. The frame is resized so that its width = camera_fov / this.
@@ -305,7 +316,10 @@ class FlyEye:
         self.prev = None
         self.low_res = None
 
-    def __call__(self, frame_bgr: np.ndarray) -> dict[str, dict[str, float]]:
+    def __call__(self, frame_bgr: np.ndarray, dt_s: float | None = None) -> dict[str, dict[str, float]]:
+        """dt_s: real time since the previous frame. Needed for live sources,
+        where frames are dropped and the gap is not 1/fps."""
+        rate = 1.0 / dt_s if dt_s else self.fps   # frames -> per second
         h0, w0 = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -330,8 +344,8 @@ class FlyEye:
             iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
         self.prev = work
         deg_per_px = self.fov / ww
-        fx = flow[..., 0] * deg_per_px * self.fps   # deg/s
-        fy = flow[..., 1] * deg_per_px * self.fps
+        fx = flow[..., 0] * deg_per_px * rate   # deg/s
+        fy = flow[..., 1] * deg_per_px * rate
 
         # divergence (1/s): expansion = something approaching
         div = (np.gradient(fx, axis=1) + np.gradient(fy, axis=0)) / deg_per_px
@@ -488,15 +502,120 @@ class SyntheticSource:
         pass
 
 
+class LatestFrameCapture:
+    """Wraps a live camera so read() always returns the newest frame.
+
+    A background thread drains the camera continuously; frames that arrive
+    while the brain is busy are thrown away instead of queueing up. read()
+    waits for a frame newer than the last one returned (so optic flow never
+    sees the same image twice) and also returns its capture timestamp.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture):
+        if not cap.isOpened():
+            raise SystemExit("Could not open webcam")
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # best effort; not all backends honour it
+        self.cap = cap
+        self._cond = threading.Condition()
+        self._frame, self._t, self._seq, self._ok = None, 0.0, 0, True
+        self._last_seq = 0
+        self._running = True
+        self._thread = threading.Thread(target=self._grab_loop, daemon=True)
+        self._thread.start()
+
+    def _grab_loop(self):
+        while self._running:
+            ok, frame = self.cap.read()
+            t = time.perf_counter()
+            with self._cond:
+                self._ok = ok
+                if ok:
+                    self._frame, self._t = frame, t
+                    self._seq += 1
+                self._cond.notify_all()
+            if not ok:
+                break
+
+    def read(self):
+        with self._cond:
+            self._cond.wait_for(lambda: self._seq > self._last_seq or not self._ok, timeout=2.0)
+            if self._seq == self._last_seq:
+                return False, None, None
+            self._last_seq = self._seq
+            return True, self._frame, self._t
+
+    def get(self, prop):
+        return self.cap.get(prop)
+
+    def release(self):
+        self._running = False
+        self._thread.join(timeout=1.0)
+        self.cap.release()
+
+
 def open_source(src: str):
     if src in ("drum", "drum-right", "drum-left", "loom-left", "loom-right", "blank"):
         return SyntheticSource("drum-right" if src == "drum" else src), False
     if src.isdigit():
-        return cv2.VideoCapture(int(src)), True
+        return LatestFrameCapture(cv2.VideoCapture(int(src))), True
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         raise SystemExit(f"Could not open video source {src!r}")
     return cap, False
+
+
+class CameraGimbal:
+    """Lets the fly's steering output drive the pan/tilt mount the camera is on.
+
+    Wraps PanTilt from ../panTilt/panTilt.py. Pan angle is integrated from the
+    turn rate; tilt is held at a fixed offset. Angles are relative to the
+    gimbal's centre, positive = camera turns right. On this rig an increasing
+    servo angle turns the camera left, hence PAN_SERVO_SIGN = -1 (invert_pan
+    flips it for a servo mounted the other way). Moving the camera generates
+    its own optic flow, so this closes the optomotor loop the way it is
+    closed in a real fly.
+    """
+
+    def __init__(self, max_rate_deg_s: float, limit_deg: float,
+                 tilt_deg: float = 0.0, invert_pan: bool = False):
+        pantilt_dir = Path(__file__).resolve().parent.parent / "panTilt"
+        sys.path.insert(0, str(pantilt_dir))
+        from panTilt import PanTilt  # noqa: E402  (sunflower/panTilt/panTilt.py)
+
+        self.pt = PanTilt()
+        self.max_rate = max_rate_deg_s
+        self.limit = limit_deg
+        self.tilt = tilt_deg
+        self.sign = -PAN_SERVO_SIGN if invert_pan else PAN_SERVO_SIGN
+        self.pan = 0.0
+        self._sent = None
+        self._last_t = None
+        self.center()
+
+    def center(self):
+        self.pan = 0.0
+        self._last_t = None
+        self._send()
+
+    def update(self, turn_hz: float) -> float:
+        """Advance the pan angle by one frame's worth of steering; returns pan (deg)."""
+        now = time.perf_counter()
+        dt = 0.0 if self._last_t is None else min(now - self._last_t, PAN_MAX_DT_S)
+        self._last_t = now
+
+        excess = abs(turn_hz) - STEER_DEADBAND_HZ
+        if excess > 0:
+            frac = min(excess / (STEER_FULL_SCALE_HZ - STEER_DEADBAND_HZ), 1.0)
+            rate = np.sign(turn_hz) * frac * self.max_rate
+            self.pan = float(np.clip(self.pan + rate * dt, -self.limit, self.limit))
+        self._send()
+        return self.pan
+
+    def _send(self):
+        cmd = (int(round(self.sign * self.pan)), int(round(self.tilt)))
+        if cmd != self._sent:   # servos only take whole degrees; skip redundant writes
+            self.pt.panTiltRelative(*cmd)
+            self._sent = cmd
 
 
 def load_autopilot(path: Path):
@@ -604,6 +723,16 @@ def main():
     ap.add_argument("--headless", action="store_true", help="no window")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--pantilt", action="store_true",
+                    help="let the fly's steering drive the pan/tilt camera mount")
+    ap.add_argument("--pan-rate", type=float, default=PAN_MAX_RATE_DEG_S,
+                    help="pan speed at full-scale steering, deg/s")
+    ap.add_argument("--pan-limit", type=float, default=PAN_LIMIT_DEG,
+                    help="max pan either side of centre, deg")
+    ap.add_argument("--pan-invert", action="store_true",
+                    help="reverse pan direction (if the camera turns the wrong way)")
+    ap.add_argument("--tilt", type=float, default=0.0,
+                    help="fixed tilt relative to centre, deg")
     args = ap.parse_args()
 
     ensure_data(args.data_dir)
@@ -612,6 +741,8 @@ def main():
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     eye = FlyEye(args.fov, fps)
     brain_ms = args.brain_ms_per_frame or 1000.0 / fps
+    gimbal = (CameraGimbal(args.pan_rate, args.pan_limit, args.tilt, args.pan_invert)
+              if args.pantilt else None)
 
     ap_t, ap_yaw = load_autopilot(args.compare) if args.compare else (None, None)
     trace_fly, trace_ap = collections.deque(maxlen=400), collections.deque(maxlen=400)
@@ -623,36 +754,55 @@ def main():
         header = ["frame", "video_t_s", "brain_t_ms", "turn_hz", "command"]
         header += [f"in_{f}_{s}" for f in FlyEye.FEATURES for s in ("left", "right")]
         header += [f"dn_{n}_{s}" for n in READOUT_CELL_TYPES for s in ("left", "right")]
+        if gimbal:
+            header.append("pan_deg")
         log_w.writerow(header)
 
     frame_i = 0
+    t_start = t_prev_frame = None
     try:
         while True:
-            ok, frame = cap.read()
+            if live:
+                ok, frame, t_frame = cap.read()   # newest frame; stale ones dropped
+            else:
+                (ok, frame), t_frame = cap.read(), None
             if not ok:
                 break
             if args.mirror:
                 frame = cv2.flip(frame, 1)
             t_wall = time.perf_counter()
 
-            feats = eye(frame)
+            frame_dt = None
+            if t_frame is not None:
+                if t_start is None:
+                    t_start = t_frame
+                if t_prev_frame is not None:
+                    frame_dt = t_frame - t_prev_frame
+                t_prev_frame = t_frame
+            feats = eye(frame, frame_dt)
             r = ctrl.step(feats, brain_ms)
+            if gimbal:
+                gimbal.update(r.turn_hz)
 
             wall = time.perf_counter() - t_wall
             speed = (brain_ms / 1000.0) / max(wall, 1e-6)
-            video_t = frame_i / fps
+            video_t = (t_frame - t_start) if t_frame is not None else frame_i / fps
             trace_fly.append(r.turn_hz)
             if ap_t is not None:
                 trace_ap.append(float(np.interp(video_t, ap_t, ap_yaw)))
 
             info = (f"frame {frame_i}  video {video_t:5.2f}s  brain {ctrl.brain.t_ms/1000:5.2f}s  "
                     f"{speed:4.2f}x realtime")
+            if gimbal:
+                info += f"  pan {gimbal.pan:+.0f} deg"
             vis = draw_overlay(frame, eye, feats, r, info, trace_fly, trace_ap)
 
             if log_w:
                 row = [frame_i, f"{video_t:.3f}", f"{ctrl.brain.t_ms:.1f}", f"{r.turn_hz:.2f}", r.command]
                 row += [f"{feats[f][s]:.3f}" for f in FlyEye.FEATURES for s in ("left", "right")]
                 row += [f"{r.rates[n][s]:.1f}" for n in READOUT_CELL_TYPES for s in ("left", "right")]
+                if gimbal:
+                    row.append(f"{gimbal.pan:.1f}")
                 log_w.writerow(row)
             if args.out:
                 if writer is None:
@@ -666,6 +816,8 @@ def main():
                     break
                 if key == ord("r"):
                     ctrl.reset()
+                    if gimbal:
+                        gimbal.center()
             elif frame_i % 10 == 0:
                 print(info, "|", r.command, f"turn {r.turn_hz:+.1f} Hz")
 
@@ -673,6 +825,8 @@ def main():
             if args.max_frames and frame_i >= args.max_frames:
                 break
     finally:
+        if gimbal:
+            gimbal.center()
         cap.release()
         if writer:
             writer.release()

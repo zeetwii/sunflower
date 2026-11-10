@@ -50,8 +50,8 @@ class PanTilt:
 
             if actualPanAngle < 0: # if less than min angle
                 actualPanAngle = 0
-            elif actualPanAngle > 180: # if greater than max angle
-                actualPanAngle = 180
+            elif actualPanAngle > 270: # if greater than max angle
+                actualPanAngle = 270
 
             if actualTiltAngle < self.minTiltAngle: # if less than min angle 
                 actualTiltAngle = self.minTiltAngle
@@ -76,8 +76,8 @@ class PanTilt:
         if not self.simulationMode:
             if panAngle < 0: # if less than min angle
                 panAngle = 0
-            elif panAngle > 180: # if greater than max angle
-                panAngle = 180
+            elif panAngle > 270: # if greater than max angle
+                panAngle = 270
 
             if tiltAngle < self.minTiltAngle: # if less than min angle 
                 tiltAngle = self.minTiltAngle

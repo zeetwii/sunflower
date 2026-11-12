@@ -89,7 +89,7 @@ READOUT_CELL_TYPES = {
 }
 
 READOUT_WINDOW_MS = 200.0   # rolling window for spike-rate estimates
-STEER_DEADBAND_HZ = 2.0     # L-R difference below this counts as "straight"
+STEER_DEADBAND_HZ = 0.2     # L-R difference below this counts as "straight"
 STEER_FULL_SCALE_HZ = 15.0  # L-R difference drawn as a hard turn on screen
 MOVE_FULL_SCALE_HZ = 15.0   # forward-minus-backward rate drawn as a full-length arrow
 ESCAPE_THRESHOLD_HZ = 20.0  # giant fiber rate that counts as "escape"
